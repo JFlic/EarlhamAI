@@ -1,0 +1,44 @@
+requests
+bs4
+psycopg2
+pandas
+dotenv
+docling
+sentence_transformers
+torch
+langchain
+langchain_community
+langchain_docling
+langchain_core
+langdetect
+pydantic
+
+#API Stuff
+fastapi
+python-jose
+passlib
+uvicorn
+bcrypt
+python-multipart
+
+# utils
+# transformers
+# #flash_attn --no-build-isolation
+# #faiss-cpu
+# fastapi
+# uvicorn==0.15.0
+
+# html2text
+# pandas
+# pydantic==2.10.6
+# python-dotenv==0.19.0
+# retrieve
+# python-multipart==0.0.5
+# passlib[bcrypt]==1.7.4
+
+
+# transformers>=4.36.0
+# accelerate>=0.25.0
+# bitsandbytes>=0.41.0
+# sentencepiece>=0.1.99
+# protobuf>=3.20.0

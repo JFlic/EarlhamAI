@@ -1,0 +1,7 @@
+freedomracingdata
+.venv
+.env
+TempDocumentStore
+__pycache__
+earlham_iowa_data
+discovered_files.csv
