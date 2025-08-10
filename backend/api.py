@@ -201,6 +201,7 @@ app.add_middleware(
         "https://lamoni-rod-wigit.vercel.app",
         "https://freedom-racing.vercel.app",
         "https://*.vercel.app",
+        "https://earlham-ai.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -247,7 +248,7 @@ async def my_query_endpoint(query: QueryRequest):
         
         # Run the query processing in a thread pool to avoid blocking
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(thread_pool, lambda: asyncio.run(process_query(query.query)))
+        result = await process_query(query.query)
         
         process_end_time = time.time()
         process_time = process_end_time - process_start_time

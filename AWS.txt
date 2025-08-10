@@ -178,3 +178,6 @@ aws cloudfront create-distribution --distribution-config file://distribution-con
 2. **Per-query pricing**: $0.10 per search
 3. **Annual license**: $2000-5000/year
 4. **Hybrid**: Base fee + usage charges
+
+docker output?
+32752D89-6DB1-44E1-A5DC-F507BDBD28A7/20250808014300

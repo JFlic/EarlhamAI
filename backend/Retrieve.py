@@ -16,8 +16,12 @@ from langdetect.lang_detect_exception import LangDetectException
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
+from deep_translator import GoogleTranslator
 
 from VectorTools import VectorDB
+
+# Create a shared thread pool for blocking work
+thread_pool = ThreadPoolExecutor(max_workers=10)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -56,31 +60,25 @@ def return_db_connection(vector_db):
         else:
             vector_db.close()
 
-def get_llm_instance():
-    """Get or create an LLM instance for the current thread."""
-    if not hasattr(thread_local, 'llm'):
-        thread_local.llm = Ollama(
-            model="qwen3:4b",
-            base_url="http://localhost:11434",
-            temperature=0.2,
-            top_p=0.95
-        )
-    return thread_local.llm
+LLM_INSTANCE = Ollama(
+    model="qwen3:8b",  # quantized for speed
+    base_url="http://localhost:11434",
+    temperature=0.2,
+    top_p=0.95
+)
 
 def create_prompt_template(language: str = "English") -> PromptTemplate:
     """
     Create a prompt template for the specified language.
     This eliminates the need for separate PROMPT and SPANISH_PROMPT templates.
     """
-    language_instruction = "" if language == "English" else "Respond in Spanish."
     
     return PromptTemplate.from_template(
-        f""""role": "You are an AI assistant for the FreedomRacing. Which is a Tool and Auto,
-        LLC that offers a huge selection of automotive specialty tools and specialty car parts for mechanics.
+        f""""role": "You are an AI assistant for the Town of Earlham Iowa.
         You can provide information, answer questions and perform other tasks as needed.
         Today's date is {{current_date}}. Please be aware of this when discussing events, 
         deadlines, or time-sensitive information.
-        Don't repeat queries. {language_instruction}" 
+        Don't repeat queries."
         
         \n---------------------\n{{context}}\n---------------------\n
         
@@ -115,7 +113,7 @@ def detect_language_and_translate(query: str) -> List[str]:
     - Second element is the English translation if Spanish, or the original query if English
     """
     start_time = time.time()
-    llm = get_llm_instance()
+    llm = LLM_INSTANCE
     
     # Create translate prompt template
     translate_prompt = PromptTemplate.from_template(
@@ -148,7 +146,7 @@ def create_rag_chain(documents: List[Document], language: str, current_date: str
     Create a RAG chain for the specified language.
     This consolidates the chain creation logic that was duplicated.
     """
-    llm = get_llm_instance()
+    llm = LLM_INSTANCE
     prompt_template = create_prompt_template(language)
     question_answer_chain = create_stuff_documents_chain(llm, prompt_template.partial(current_date=current_date))
     retriever = SimpleRetriever(documents=documents)
@@ -186,80 +184,89 @@ def extract_sources(results: List[Dict]) -> List[Dict]:
 
 async def process_query(query: str) -> Dict[str, Any]:
     start_time = time.time()
-    
+
     try:
         # Get database connection from pool
         vector_db = get_db_connection()
-        
+
+        # 1️⃣ Language detection + translation (fast, in main loop)
+        lang_start = time.time()
         try:
-            # Detect language and translate if necessary
-            lang_start = time.time()
-            language_info = detect_language_and_translate(query)
-            lang_end = time.time()
-            print(f"TIMING: Language detection and translation took {lang_end - lang_start:.4f} seconds")
-            print(language_info)
-            
-            # language_info[0] is "Spanish" or "English"
-            # language_info[1] is the translated query (or original if English)
-            detected_language = language_info[0]
-            search_query = language_info[1]  # Use the English query for vector search
-            
-            # Get current date for including in prompt
-            current_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
-            
-            # Perform similarity search
-            vector_start = time.time()
-            print(f"DEBUG: About to perform vector search with query: {search_query}")
-            results = vector_db.similarity_search(search_query, k=5)
-            vector_end = time.time()
-            for result in results:
-                print(Document(page_content=result['content']))
-            print(f"TIMING: Vector similarity search took {vector_end - vector_start:.4f} seconds")
-            print(f"DEBUG: Found {len(results)} results from vector search")
-            
-            # Extract sources from results
-            sources = extract_sources(results)
+            lang = langdetect.detect(query)
+        except:
+            lang = "en"
 
-            # Convert results to Document objects
-            documents = [Document(page_content=result['content'], metadata=result['metadata']) for result in results]
-            print(f"DEBUG: Created {len(documents)} Document objects")
+        if lang == "es":
+            detected_language = "Spanish"
+            search_query = GoogleTranslator(source='es', target='en').translate(query)
+        else:
+            detected_language = "English"
+            search_query = query
+        lang_end = time.time()
+        print(f"TIMING: Language detection+translation took {lang_end - lang_start:.4f} seconds")
 
+        # Get current date for prompt
+        current_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
 
-            # Create RAG chain for the detected language
-            llm_start = time.time()
-            rag_chain = create_rag_chain(documents, detected_language, current_date)
-            
-            # Get response using the English query
-            print(f"DEBUG: About to invoke RAG chain with query: {search_query}")
-            response = rag_chain.invoke({"input": search_query})
+        # 2️⃣ Kick off vector search and prompt creation concurrently
+        loop = asyncio.get_event_loop()
 
-            # Remove <think>...</think> content
-            if response.get("answer"):
-                response["answer"] = re.sub(r"<think>.*?</think>", "", response["answer"], flags=re.DOTALL).strip()
+        vector_task = loop.run_in_executor(
+            thread_pool, lambda: vector_db.similarity_search(search_query, k=3)
+        )
 
-            llm_end = time.time()
-            print(f"TIMING: LLM response generation took {llm_end - llm_start:.4f} seconds")
-            
-            end_time = time.time()
-            print(f"TIMING: Total process_query function took {end_time - start_time:.4f} seconds")
-            
-            return {
-                "answer": response["answer"],
-                "sources": sources,
-                "language_info": language_info
-            }
-                
-        finally:
-            # Always return the database connection to the pool
-            return_db_connection(vector_db)
-            
+        # Prepare prompt template while vector search runs
+        prompt_template = create_prompt_template(detected_language)
+
+        # Wait for vector search results
+        results = await vector_task
+        print(f"DEBUG: Vector similarity search returned {len(results)} results")
+
+        # 3️⃣ Process documents
+        sources = extract_sources(results)
+        documents = [
+            Document(page_content=r['content'][:1000], metadata=r['metadata'])
+            for r in results
+        ]
+
+        # 4️⃣ Create RAG chain
+        question_answer_chain = create_stuff_documents_chain(
+            LLM_INSTANCE,
+            prompt_template.partial(current_date=current_date)
+        )
+        retriever = SimpleRetriever(documents=documents)
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+        # 5️⃣ Run LLM in thread pool (doesn’t block other users)
+        llm_task = loop.run_in_executor(
+            thread_pool, lambda: rag_chain.invoke({"input": search_query})
+        )
+        response = await llm_task
+
+        # Remove <think>...</think> tags if present
+        if response.get("answer"):
+            response["answer"] = re.sub(
+                r"<think>.*?</think>", "", response["answer"], flags=re.DOTALL
+            ).strip()
+
+        total_time = time.time() - start_time
+        print(f"TIMING: Total process_query took {total_time:.4f} seconds")
+
+        return {
+            "answer": response.get("answer", ""),
+            "sources": sources,
+            "language_info": [detected_language, search_query]
+        }
+
     except Exception as e:
-        end_time = time.time()
-        print(f"TIMING: process_query function failed after {end_time - start_time:.4f} seconds")
-        print(f"ERROR DETAILS: {str(e)}")
+        print(f"ERROR: process_query failed after {time.time() - start_time:.4f} seconds")
+        print(f"DETAILS: {str(e)}")
         import traceback
-        print(f"TRACEBACK: {traceback.format_exc()}")
+        print(traceback.format_exc())
         return {"error": str(e)}
+
+    finally:
+        return_db_connection(vector_db)
 
 class SimpleRetriever(BaseRetriever):
     documents: List[Document] = Field(default_factory=list)
