@@ -2,9 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, sta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import StreamingResponse
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from Retrieve import process_query, process_query_streaming
 from Retrieve import process_query, process_query_streaming
 from VectorTools import process_documents, VectorDB
 import time
