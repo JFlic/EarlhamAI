@@ -58,7 +58,7 @@ def return_db_connection(vector_db):
         if len(db_connection_pool) < MAX_DB_CONNECTIONS:
             db_connection_pool.append(vector_db)
         else:
-            vector_db.close()
+            vector_db.close() #Yeah
 
 LLM_INSTANCE = Ollama(
     model="qwen3:8b",  # quantized for speed
