@@ -9,7 +9,7 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, AsyncGenerator
 from pydantic import Field
 import langdetect
 from langdetect.lang_detect_exception import LangDetectException
@@ -61,7 +61,7 @@ def return_db_connection(vector_db):
             vector_db.close()
 
 LLM_INSTANCE = Ollama(
-    model="qwen3:8b",  # quantized for speed
+    model="qwen3:4b",  # quantized for speed
     base_url="http://localhost:11434",
     temperature=0.2,
     top_p=0.95
@@ -273,6 +273,142 @@ class SimpleRetriever(BaseRetriever):
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
         return self.documents
+
+async def process_query_streaming(query: str) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    Process query with streaming LLM responses.
+    Yields chunks of content as they become available.
+    """
+    start_time = time.time()
+    
+    try:
+        # Get database connection from pool
+        vector_db = get_db_connection()
+        
+        # 1️⃣ Language detection + translation (fast, in main loop)
+        lang_start = time.time()
+        try:
+            lang = langdetect.detect(query)
+        except:
+            lang = "en"
+
+        if lang == "es":
+            detected_language = "Spanish"
+            search_query = GoogleTranslator(source='es', target='en').translate(query)
+        else:
+            detected_language = "English"
+            search_query = query
+        lang_end = time.time()
+        print(f"TIMING: Language detection+translation took {lang_end - lang_start:.4f} seconds")
+
+        # Get current date for prompt
+        current_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
+
+        # 2️⃣ Kick off vector search and prompt creation concurrently
+        loop = asyncio.get_event_loop()
+
+        vector_task = loop.run_in_executor(
+            thread_pool, lambda: vector_db.similarity_search(search_query, k=3)
+        )
+
+        # Prepare prompt template while vector search runs
+        prompt_template = create_prompt_template(detected_language)
+
+        # Wait for vector search results
+        results = await vector_task
+        print(f"DEBUG: Vector similarity search returned {len(results)} results")
+
+        # 3️⃣ Process documents
+        sources = extract_sources(results)
+        documents = [
+            Document(page_content=r['content'][:1000], metadata=r['metadata'])
+            for r in results
+        ]
+
+        # Send sources first
+        yield {"type": "sources", "sources": sources}
+
+        # 4️⃣ Create RAG chain with streaming LLM
+        retriever = SimpleRetriever(documents=documents)
+        question_answer_chain = create_stuff_documents_chain(
+            LLM_INSTANCE,
+            prompt_template.partial(current_date=current_date)
+        )
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+        # 5️⃣ Stream the response
+        print("🤖 Starting to stream LLM response...")
+        
+        # Stream the response
+        loop = asyncio.get_event_loop()
+        response_stream = await loop.run_in_executor(
+            thread_pool, 
+            lambda: rag_chain.stream({"input": search_query})
+        )
+        
+        # Process streaming response
+        full_answer = ""
+        in_think_block = False
+        
+        for chunk in response_stream:
+            if "answer" in chunk:
+                # Extract new content
+                new_content = chunk["answer"]
+                if new_content and new_content != full_answer:
+                    # Get only the new part
+                    if new_content.startswith(full_answer):
+                        new_part = new_content[len(full_answer):]
+                        if new_part:
+                            full_answer = new_content
+                            
+                            # Handle <think> tags properly
+                            # Check if we're entering a think block
+                            if "<think>" in new_part:
+                                in_think_block = True
+                                # Send content before the think block
+                                before_think = new_part.split("<think>")[0]
+                                if before_think.strip():
+                                    yield {"type": "content", "content": before_think}
+                                # Continue to next chunk
+                                continue
+                            
+                            # Check if we're exiting a think block
+                            if "</think>" in new_part:
+                                in_think_block = False
+                                # Send content after the think block
+                                after_think = new_part.split("</think>")[1]
+                                if after_think.strip():
+                                    yield {"type": "content", "content": after_think}
+                                continue
+                            
+                            # If we're in a think block, skip this content
+                            if in_think_block:
+                                continue
+                            
+                            # Otherwise, send the content normally
+                            if new_part.strip():
+                                yield {"type": "content", "content": new_part}
+
+        # Send metadata
+        total_time = time.time() - start_time
+        yield {
+            "type": "metadata", 
+            "metadata": {
+                "language_info": [detected_language, search_query],
+                "processing_time": f"{total_time:.4f} seconds",
+                "total_chunks": len(sources)
+            }
+        }
+
+    except Exception as e:
+        print(f"ERROR: process_query_streaming failed after {time.time() - start_time:.4f} seconds")
+        print(f"DETAILS: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        yield {"type": "error", "error": str(e)}
+
+    finally:
+        return_db_connection(vector_db)
 
 if __name__ == "__main__":
     # Test the query processing
