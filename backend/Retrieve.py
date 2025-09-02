@@ -9,7 +9,8 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from typing import List, Dict, Any, Tuple, AsyncGenerator
+from langchain_ollama import OllamaLLM
+from typing import List, Dict, Any, Tuple
 from pydantic import Field
 import langdetect
 from langdetect.lang_detect_exception import LangDetectException
@@ -65,6 +66,15 @@ LLM_INSTANCE = Ollama(
     base_url="http://localhost:11434",
     temperature=0.2,
     top_p=0.95
+)
+
+# Streaming LLM instance
+LLM_STREAMING_INSTANCE = OllamaLLM(
+    model="qwen3:4b",  # quantized for speed
+    base_url="http://localhost:11434",
+    temperature=0.2,
+    top_p=0.95,
+    streaming=True
 )
 
 def create_prompt_template(language: str = "English") -> PromptTemplate:
@@ -249,6 +259,8 @@ async def process_query(query: str) -> Dict[str, Any]:
                 r"<think>.*?</think>", "", response["answer"], flags=re.DOTALL
             ).strip()
 
+        print(response["answer"])
+
         total_time = time.time() - start_time
         print(f"TIMING: Total process_query took {total_time:.4f} seconds")
 
@@ -268,23 +280,15 @@ async def process_query(query: str) -> Dict[str, Any]:
     finally:
         return_db_connection(vector_db)
 
-class SimpleRetriever(BaseRetriever):
-    documents: List[Document] = Field(default_factory=list)
-
-    def _get_relevant_documents(self, query: str) -> List[Document]:
-        return self.documents
-
-async def process_query_streaming(query: str) -> AsyncGenerator[Dict[str, Any], None]:
-    """
-    Process query with streaming LLM responses.
-    Yields chunks of content as they become available.
-    """
+async def process_query_streaming(query: str):
+    """Streaming version of process_query that yields chunks as they're generated"""
     start_time = time.time()
-    
+    vector_db = None
+
     try:
         # Get database connection from pool
         vector_db = get_db_connection()
-        
+
         # 1️⃣ Language detection + translation (fast, in main loop)
         lang_start = time.time()
         try:
@@ -326,89 +330,66 @@ async def process_query_streaming(query: str) -> AsyncGenerator[Dict[str, Any], 
         ]
 
         # Send sources first
-        yield {"type": "sources", "sources": sources}
+        yield {'type': 'sources', 'sources': sources}
 
-        # 4️⃣ Create RAG chain with streaming LLM
-        retriever = SimpleRetriever(documents=documents)
+        # 4️⃣ Create streaming RAG chain
         question_answer_chain = create_stuff_documents_chain(
-            LLM_INSTANCE,
+            LLM_STREAMING_INSTANCE,
             prompt_template.partial(current_date=current_date)
         )
+        retriever = SimpleRetriever(documents=documents)
         rag_chain = create_retrieval_chain(retriever, question_answer_chain)
 
-        # 5️⃣ Stream the response
-        print("🤖 Starting to stream LLM response...")
-        
-        # Stream the response
-        loop = asyncio.get_event_loop()
-        response_stream = await loop.run_in_executor(
-            thread_pool, 
-            lambda: rag_chain.stream({"input": search_query})
-        )
-        
-        # Process streaming response
-        full_answer = ""
-        in_think_block = False
-        
-        for chunk in response_stream:
-            if "answer" in chunk:
-                # Extract new content
-                new_content = chunk["answer"]
-                if new_content and new_content != full_answer:
-                    # Get only the new part
-                    if new_content.startswith(full_answer):
-                        new_part = new_content[len(full_answer):]
-                        if new_part:
-                            full_answer = new_content
-                            
-                            # Handle <think> tags properly
-                            # Check if we're entering a think block
-                            if "<think>" in new_part:
-                                in_think_block = True
-                                # Send content before the think block
-                                before_think = new_part.split("<think>")[0]
-                                if before_think.strip():
-                                    yield {"type": "content", "content": before_think}
-                                # Continue to next chunk
-                                continue
-                            
-                            # Check if we're exiting a think block
-                            if "</think>" in new_part:
-                                in_think_block = False
-                                # Send content after the think block
-                                after_think = new_part.split("</think>")[1]
-                                if after_think.strip():
-                                    yield {"type": "content", "content": after_think}
-                                continue
-                            
-                            # If we're in a think block, skip this content
-                            if in_think_block:
-                                continue
-                            
-                            # Otherwise, send the content normally
-                            if new_part.strip():
-                                yield {"type": "content", "content": new_part}
+        # 5️⃣ Stream LLM response
+        def stream_llm():
+            try:
+                # Use the regular invoke method to get the full response
+                response = rag_chain.invoke({"input": search_query})
+                if "answer" in response:
+                    answer = response["answer"]
+                    # Remove <think>...</think> tags if present
+                    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+                    return answer
+                return "No response generated"
+            except Exception as e:
+                print(f"Error in streaming LLM: {str(e)}")
+                return f"Error: {str(e)}"
 
-        # Send metadata
+        # Run LLM in thread pool
+        llm_task = loop.run_in_executor(thread_pool, stream_llm)
+        
+        # Get the full response
+        full_response = await llm_task
+        
+        # Stream the response in larger chunks for better readability
+        chunk_size = 10  # Characters per chunk for smooth streaming
+        for i in range(0, len(full_response), chunk_size):
+            chunk = full_response[i:i + chunk_size]
+            yield {'type': 'content', 'text': chunk}
+            # Small delay to simulate real-time streaming
+            await asyncio.sleep(0.1)
+
         total_time = time.time() - start_time
-        yield {
-            "type": "metadata", 
-            "metadata": {
-                "language_info": [detected_language, search_query],
-                "processing_time": f"{total_time:.4f} seconds",
-                "total_chunks": len(sources)
-            }
-        }
+        print(f"TIMING: Total process_query_streaming took {total_time:.4f} seconds")
+
+        yield {'type': 'done'}
 
     except Exception as e:
         print(f"ERROR: process_query_streaming failed after {time.time() - start_time:.4f} seconds")
         print(f"DETAILS: {str(e)}")
         import traceback
         print(traceback.format_exc())
-        yield {"type": "error", "error": str(e)}
+        yield {'type': 'error', 'error': str(e)}
 
     finally:
-        return_db_connection(vector_db)
+        if vector_db:
+            return_db_connection(vector_db)
+
+class SimpleRetriever(BaseRetriever):
+    documents: List[Document] = Field(default_factory=list)
+
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        return self.documents
 
 if __name__ == "__main__":
     # Test the query processing
@@ -443,4 +424,3 @@ if __name__ == "__main__":
     seconds = elapsed_time % 60
 
     print(f"\nTotal process execution time: {days} days, {hours} hours, {minutes} minutes, and {seconds:.2f} seconds")
-# Test
