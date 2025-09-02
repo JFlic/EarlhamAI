@@ -98,6 +98,15 @@
         .sources-list li {
             margin-bottom: 5px;
         }
+        .streaming-cursor {
+            animation: blink 1s infinite;
+            color: #0d6efd;
+            font-weight: bold;
+        }
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
+        }
     </style>
 </head>
 <body>
@@ -166,7 +175,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // Configuration
     const config = {
         apiEndpoint: 'http://127.0.0.1:8001/query/',
+        streamEndpoint: 'http://127.0.0.1:8001/query/stream',
         timeout: 30000, // 30 seconds timeout
+        useStreaming: true, // Toggle between streaming and regular mode
     };
     
     // Initially hide the chat widget
@@ -190,7 +201,7 @@ document.addEventListener('DOMContentLoaded', function() {
         chatToggle.style.display = 'block';
     });
     
-    // Send message
+    // Send message with streaming or fallback to regular
     async function sendMessage() {
         const message = userInput.value.trim();
         if (message) {
@@ -198,47 +209,219 @@ document.addEventListener('DOMContentLoaded', function() {
             userInput.value = '';
             loadingIndicator.classList.add('active');
             
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+            if (config.useStreaming) {
+                await sendMessageStreaming(message);
+            } else {
+                await sendMessageRegular(message);
+            }
+        }
+    }
+    
+    // Regular non-streaming message sending
+    async function sendMessageRegular(message) {
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), config.timeout);
+            
+            const response = await fetch(config.apiEndpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                },
+                mode: 'cors',
+                credentials: 'omit',
+                body: JSON.stringify({ query: message }),
+                signal: controller.signal
+            });
+            
+            clearTimeout(timeoutId);
+            
+            if (!response.ok) {
+                throw new Error(`Server responded with status: ${response.status}`);
+            }
+            
+            const data = await response.json();
+            if (data.answer) {
+                addMessage(data.answer, 'ai', data.sources);
+            } else {
+                throw new Error('No answer received from server');
+            }
+        } catch (error) {
+            console.error('Error:', error);
+            let errorMessage = "I apologize, but I'm having trouble connecting to the AI service right now. Please try again later.";
+            
+            if (error.name === 'AbortError') {
+                errorMessage = "The request timed out. Please try again.";
+            }
+            
+            addMessage(errorMessage, 'ai');
+        } finally {
+            loadingIndicator.classList.remove('active');
+        }
+    }
+    
+    // Streaming message sending
+    async function sendMessageStreaming(message) {
+        try {
+                // Create streaming message container
+                const streamingMessageDiv = createStreamingMessage();
+                let currentSources = null;
+                let fullResponse = '';
                 
-                const response = await fetch(config.apiEndpoint, {
+                // Send POST request to get streaming endpoint
+                const response = await fetch(config.streamEndpoint, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
-                        'Accept': 'application/json',
+                        'Accept': 'text/event-stream',
                     },
                     mode: 'cors',
                     credentials: 'omit',
-                    body: JSON.stringify({ query: message }),
-                    signal: controller.signal
+                    body: JSON.stringify({ query: message })
                 });
-                
-                clearTimeout(timeoutId);
                 
                 if (!response.ok) {
                     throw new Error(`Server responded with status: ${response.status}`);
                 }
                 
-                const data = await response.json();
-                if (data.answer) {
-                    addMessage(data.answer, 'ai', data.sources);
-                } else {
-                    throw new Error('No answer received from server');
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                let errorMessage = "I apologize, but I'm having trouble connecting to the AI service right now. Please try again later.";
+                // Read the streaming response
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
                 
-                if (error.name === 'AbortError') {
-                    errorMessage = "The request timed out. Please try again.";
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    
+                    // Keep the last incomplete line in the buffer
+                    buffer = lines.pop() || '';
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            try {
+                                const data = JSON.parse(line.slice(6));
+                                console.log('Received data:', data); // Debug log
+                                
+                                if (data.type === 'content') {
+                                    fullResponse += data.text;
+                                    console.log('Full response so far:', fullResponse); // Debug log
+                                    updateStreamingMessage(streamingMessageDiv, fullResponse);
+                                } else if (data.type === 'sources') {
+                                    currentSources = data.sources;
+                                    console.log('Sources received:', currentSources); // Debug log
+                                } else if (data.type === 'done') {
+                                    console.log('Streaming done, finalizing...'); // Debug log
+                                    finalizeStreamingMessage(streamingMessageDiv, fullResponse, currentSources);
+                                    break;
+                                } else if (data.type === 'error') {
+                                    throw new Error(data.error);
+                                }
+                            } catch (parseError) {
+                                console.warn('Failed to parse SSE data:', parseError, 'Line:', line);
+                            }
+                        }
+                    }
                 }
                 
-                addMessage(errorMessage, 'ai');
-            } finally {
-                loadingIndicator.classList.remove('active');
+        } catch (error) {
+            console.error('Error:', error);
+            let errorMessage = "I apologize, but I'm having trouble connecting to the AI service right now. Please try again later.";
+            
+            if (error.name === 'AbortError') {
+                errorMessage = "The request timed out. Please try again.";
             }
+            
+            addMessage(errorMessage, 'ai');
+        } finally {
+            loadingIndicator.classList.remove('active');
         }
+    }
+    
+    // Create a streaming message container
+    function createStreamingMessage() {
+        const messageDiv = document.createElement('div');
+        messageDiv.className = 'mb-3 ai-message streaming-message';
+        
+        messageDiv.innerHTML = `
+            <div class="d-flex">
+                <div class="me-2">
+                    <div class="rounded-circle bg-primary text-white d-flex align-items-center justify-content-center" style="width: 32px; height: 32px;">
+                        <i class="bi bi-robot"></i>
+                    </div>
+                </div>
+                <div class="message p-2 rounded bg-light">
+                    <div class="streaming-content"></div>
+                    <span class="streaming-cursor">|</span>
+                </div>
+            </div>
+        `;
+        
+        chatMessages.appendChild(messageDiv);
+        
+        // Scroll to bottom
+        const chatContainer = chatMessages.parentElement;
+        setTimeout(() => {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }, 100);
+        
+        return messageDiv;
+    }
+    
+    // Update streaming message content
+    function updateStreamingMessage(messageDiv, content) {
+        console.log('Updating streaming message with content:', content); // Debug log
+        const contentDiv = messageDiv.querySelector('.streaming-content');
+        if (!contentDiv) {
+            console.error('Streaming content div not found!');
+            return;
+        }
+        const formattedContent = marked.parse(content);
+        contentDiv.innerHTML = formattedContent;
+        
+        // Scroll to bottom
+        const chatContainer = chatMessages.parentElement;
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+    
+    // Finalize streaming message
+    function finalizeStreamingMessage(messageDiv, content, sources) {
+        const contentDiv = messageDiv.querySelector('.streaming-content');
+        const cursorSpan = messageDiv.querySelector('.streaming-cursor');
+        
+        // Remove cursor
+        cursorSpan.remove();
+        
+        // Add sources if available
+        if (sources && sources.length > 0) {
+            const uniqueSources = sources.filter((source, index, self) =>
+                index === self.findIndex((s) => s.source === source.heading)
+            );
+            
+            const sourcesHtml = `
+                <div class="sources-section">
+                    <div class="sources-toggle" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'">
+                        <i class="bi bi-info-circle"></i> View Sources
+                    </div>
+                    <div class="sources-list" style="display: none;">
+                        <ul>
+                            ${uniqueSources.map(source => `
+                                <li>
+                                    <a href="${source.source}" target="_blank" class="text-decoration-none">${source.title}</a>
+                                </li>
+                            `).join('')}
+                        </ul>
+                    </div>
+                </div>
+            `;
+            contentDiv.innerHTML += sourcesHtml;
+        }
+        
+        // Remove streaming class
+        messageDiv.classList.remove('streaming-message');
     }
     
     sendButton.addEventListener('click', sendMessage);

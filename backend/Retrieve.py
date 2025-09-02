@@ -9,6 +9,7 @@ from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
+from langchain_ollama import OllamaLLM
 from typing import List, Dict, Any, Tuple
 from pydantic import Field
 import langdetect
@@ -61,10 +62,19 @@ def return_db_connection(vector_db):
             vector_db.close()
 
 LLM_INSTANCE = Ollama(
-    model="qwen3:8b",  # quantized for speed
+    model="qwen3:4b",  # quantized for speed
     base_url="http://localhost:11434",
     temperature=0.2,
     top_p=0.95
+)
+
+# Streaming LLM instance
+LLM_STREAMING_INSTANCE = OllamaLLM(
+    model="qwen3:4b",  # quantized for speed
+    base_url="http://localhost:11434",
+    temperature=0.2,
+    top_p=0.95,
+    streaming=True
 )
 
 def create_prompt_template(language: str = "English") -> PromptTemplate:
@@ -249,6 +259,8 @@ async def process_query(query: str) -> Dict[str, Any]:
                 r"<think>.*?</think>", "", response["answer"], flags=re.DOTALL
             ).strip()
 
+        print(response["answer"])
+
         total_time = time.time() - start_time
         print(f"TIMING: Total process_query took {total_time:.4f} seconds")
 
@@ -267,6 +279,111 @@ async def process_query(query: str) -> Dict[str, Any]:
 
     finally:
         return_db_connection(vector_db)
+
+async def process_query_streaming(query: str):
+    """Streaming version of process_query that yields chunks as they're generated"""
+    start_time = time.time()
+    vector_db = None
+
+    try:
+        # Get database connection from pool
+        vector_db = get_db_connection()
+
+        # 1️⃣ Language detection + translation (fast, in main loop)
+        lang_start = time.time()
+        try:
+            lang = langdetect.detect(query)
+        except:
+            lang = "en"
+
+        if lang == "es":
+            detected_language = "Spanish"
+            search_query = GoogleTranslator(source='es', target='en').translate(query)
+        else:
+            detected_language = "English"
+            search_query = query
+        lang_end = time.time()
+        print(f"TIMING: Language detection+translation took {lang_end - lang_start:.4f} seconds")
+
+        # Get current date for prompt
+        current_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
+
+        # 2️⃣ Kick off vector search and prompt creation concurrently
+        loop = asyncio.get_event_loop()
+
+        vector_task = loop.run_in_executor(
+            thread_pool, lambda: vector_db.similarity_search(search_query, k=3)
+        )
+
+        # Prepare prompt template while vector search runs
+        prompt_template = create_prompt_template(detected_language)
+
+        # Wait for vector search results
+        results = await vector_task
+        print(f"DEBUG: Vector similarity search returned {len(results)} results")
+
+        # 3️⃣ Process documents
+        sources = extract_sources(results)
+        documents = [
+            Document(page_content=r['content'][:1000], metadata=r['metadata'])
+            for r in results
+        ]
+
+        # Send sources first
+        yield {'type': 'sources', 'sources': sources}
+
+        # 4️⃣ Create streaming RAG chain
+        question_answer_chain = create_stuff_documents_chain(
+            LLM_STREAMING_INSTANCE,
+            prompt_template.partial(current_date=current_date)
+        )
+        retriever = SimpleRetriever(documents=documents)
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+
+        # 5️⃣ Stream LLM response
+        def stream_llm():
+            try:
+                # Use the regular invoke method to get the full response
+                response = rag_chain.invoke({"input": search_query})
+                if "answer" in response:
+                    answer = response["answer"]
+                    # Remove <think>...</think> tags if present
+                    answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+                    return answer
+                return "No response generated"
+            except Exception as e:
+                print(f"Error in streaming LLM: {str(e)}")
+                return f"Error: {str(e)}"
+
+        # Run LLM in thread pool
+        llm_task = loop.run_in_executor(thread_pool, stream_llm)
+        
+        # Get the full response
+        full_response = await llm_task
+        
+        # Stream the response in larger chunks for better readability
+        chunk_size = 10  # Characters per chunk for smooth streaming
+        for i in range(0, len(full_response), chunk_size):
+            chunk = full_response[i:i + chunk_size]
+            yield {'type': 'content', 'text': chunk}
+            # Small delay to simulate real-time streaming
+            await asyncio.sleep(0.1)
+
+        total_time = time.time() - start_time
+        print(f"TIMING: Total process_query_streaming took {total_time:.4f} seconds")
+
+        yield {'type': 'done'}
+
+    except Exception as e:
+        print(f"ERROR: process_query_streaming failed after {time.time() - start_time:.4f} seconds")
+        print(f"DETAILS: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        yield {'type': 'error', 'error': str(e)}
+
+    finally:
+        if vector_db:
+            return_db_connection(vector_db)
 
 class SimpleRetriever(BaseRetriever):
     documents: List[Document] = Field(default_factory=list)

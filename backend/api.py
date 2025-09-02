@@ -1,8 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from Retrieve import process_query
+from Retrieve import process_query, process_query_streaming
 from VectorTools import process_documents, VectorDB
 import time
 import os
@@ -17,6 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import uuid
 import uvicorn
+import json
+
+
 
 # Load environment variables
 load_dotenv()
@@ -247,7 +251,6 @@ async def my_query_endpoint(query: QueryRequest):
         process_start_time = time.time()
         
         # Run the query processing in a thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
         result = await process_query(query.query)
         
         process_end_time = time.time()
@@ -280,6 +283,51 @@ async def my_query_endpoint(query: QueryRequest):
     finally:
         # End tracking this query
         user_tracker.end_query(user_id)
+
+@app.post("/query/stream")
+async def stream_query_endpoint(query: QueryRequest):
+    """Streaming endpoint for real-time LLM responses"""
+    # Generate unique user ID for this request
+    user_id = str(uuid.uuid4())
+    
+    # Start tracking this query
+    user_tracker.start_query(user_id, query.query)
+    
+    async def generate_stream():
+        try:
+            # Send initial metadata
+            yield f"data: {json.dumps({'type': 'metadata', 'user_id': user_id})}\n\n"
+            
+            # Process query with streaming
+            async for chunk in process_query_streaming(query.query):
+                if chunk.get('type') == 'content':
+                    yield f"data: {json.dumps({'type': 'content', 'text': chunk['text']})}\n\n"
+                elif chunk.get('type') == 'sources':
+                    yield f"data: {json.dumps({'type': 'sources', 'sources': chunk['sources']})}\n\n"
+                elif chunk.get('type') == 'done':
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                    break
+                elif chunk.get('type') == 'error':
+                    yield f"data: {json.dumps({'type': 'error', 'error': chunk['error']})}\n\n"
+                    break
+                    
+        except Exception as e:
+            print(f"ERROR in streaming: {str(e)}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        finally:
+            # End tracking this query
+            user_tracker.end_query(user_id)
+    
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 @app.post("/query/token")
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
