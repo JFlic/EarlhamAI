@@ -61,7 +61,7 @@ def return_db_connection(vector_db):
             vector_db.close() #Yeah
 
 LLM_INSTANCE = Ollama(
-    model="qwen3:8b",  # quantized for speed
+    model="qwen3:4b",  # quantized for speed
     base_url="http://localhost:11434",
     temperature=0.2,
     top_p=0.95
